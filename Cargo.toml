@@ -1,0 +1,24 @@
+[package]
+name = "tn3270"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "IBM 3270 terminal emulator and automation library: TN3270/TN3270E protocol, screen model, and scripting primitives, with no C dependencies"
+keywords = ["3270", "tn3270", "mainframe", "terminal", "automation"]
+categories = ["network-programming", "emulators"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+
+[features]
+# The protocol core is sans-IO and dependency-free.  Transports are opt-in.
+default = ["tcp"]
+# A blocking TCP transport. The protocol core itself needs no features and has
+# no dependencies.
+tcp = []
+
+[dependencies]
+
+[dev-dependencies]
+
+[profile.test]
+opt-level = 1
