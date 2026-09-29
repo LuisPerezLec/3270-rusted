@@ -543,12 +543,11 @@ impl Negotiator {
                     out.extend_from_slice(&telnet::subnegotiation(OPT_TERMINAL_TYPE, &sb));
                     self.terminal_type_sent = true;
                     self.device_type = Some(self.config.device_type);
-                    // The host now turns on BINARY and EOR; offer them too.
-                    for opt in [OPT_EOR, OPT_BINARY] {
-                        if self.do_sent.insert(opt) {
-                            out.extend_from_slice(&telnet::command(Verb::Do, opt));
-                        }
-                    }
+                    // Deliberately do NOT offer BINARY and EOR here. Sending an
+                    // unsolicited DO is legal telnet, but Hercules stops
+                    // negotiating when it arrives, and a real MVS host is the
+                    // authority on what is safe. The host drives this exchange:
+                    // it sends DO and WILL for both options, and we answer.
                 }
                 None
             }
@@ -823,6 +822,36 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn the_client_never_offers_binary_or_eor_unsolicited() {
+        // Regression guard. Sending DO BINARY / DO EOR straight after the
+        // TERMINAL-TYPE IS is legal telnet, but Hercules running MVS 3.8j stops
+        // negotiating when it arrives, and the session hangs. Only ever answer
+        // what the host offers.
+        let mut neg = Negotiator::new(Config {
+            allow_tn3270e: false,
+            ..Config::default()
+        });
+        exchange(&mut neg, &telnet::command(Verb::Do, OPT_TERMINAL_TYPE));
+        let (reply, _) = exchange(
+            &mut neg,
+            &telnet::subnegotiation(OPT_TERMINAL_TYPE, &[TT_SEND]),
+        );
+
+        // The reply must be the terminal type and nothing else.
+        let unsolicited = telnet::command(Verb::Do, OPT_EOR);
+        assert!(
+            !reply.windows(3).any(|w| w == unsolicited),
+            "must not offer DO EOR before the host asks: {reply:02x?}"
+        );
+        let unsolicited = telnet::command(Verb::Do, OPT_BINARY);
+        assert!(
+            !reply.windows(3).any(|w| w == unsolicited),
+            "must not offer DO BINARY before the host asks: {reply:02x?}"
+        );
+        assert!(!neg.is_ready(), "not ready until BINARY and EOR are agreed");
     }
 
     #[test]

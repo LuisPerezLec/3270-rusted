@@ -57,10 +57,10 @@ independent host implementation.
 | Inbound | AID, cursor, modified fields, short reads, `SYSREQ`, Read Buffer |
 | Screen model | fields, basic and extended attributes, colour, highlighting, cursor, text search |
 | Code pages | cp037, cp273, cp500, cp1026, cp1140 |
+| TLS | 1.2 and 1.3 via `rustls`, with an internal-CA trust store, optional 1.2 pinning, and IP-SAN verification |
 
 **Not yet**
 
-* **TLS.** The next piece. It will use `rustls`, so there is still no OpenSSL to link.
 * **The full keyboard state machine.** `type_text` writes at the cursor, sets
   the modified-data-tag and refuses protected and non-numeric input. Insert
   mode, auto-skip, field overflow and `Dup`/`FieldMark` are not implemented.
@@ -78,6 +78,20 @@ The real signal is the keyboard-restore bit in the Write Control Character.
 Sending an AID locks the keyboard; the host unlocks it when it is done.
 `wait_until_unlocked` waits for exactly that, and `press` does it for you.
 `Session::is_keyboard_locked` exposes the same state to other transports.
+
+That is necessary but not always sufficient. Some hosts send a **second screen
+unprompted** — a banner followed by a logon panel, a status line repainted a
+moment later — and acting on the first one means typing into a screen that is
+about to be replaced. `wait_for_quiet(idle, timeout)` waits for the
+conversation to go quiet instead:
+
+```rust
+// MVS 3.8j under Hercules sends its banner, then a logon panel, unprompted.
+conn.wait_for_quiet(Duration::from_millis(500), timeout)?;
+```
+
+Use `wait_until_unlocked` for a request/response panel, and `wait_for_quiet`
+when the host volunteers screens. The probe below reports which case you are in.
 
 ## Layers
 
@@ -125,6 +139,12 @@ has a test naming it:
   model 4 back to 24x80.
 * **Non-display fields render blank** but keep their content in the buffer, so
   `row_text` hides a password while `field_bytes` still returns it.
+* **Never offer `DO BINARY` or `DO EOR` unsolicited.** Sending them straight
+  after the terminal type is legal telnet, and a hand-written host tolerates it,
+  but Hercules running MVS 3.8j stops negotiating and the session hangs with no
+  error. Only ever answer what the host offers.
+* **A host may paint more than one screen per turn.** Waiting only for the
+  keyboard to unlock lands you on the first of them. See the timing section.
 * **A record split across TCP reads must not be flushed early.** The decoder
   emits a record only on `IAC EOR`; pending bytes are drained as line-mode text
   only before 3270 framing begins.
@@ -135,16 +155,16 @@ has a test naming it:
 cargo test
 ```
 
-Self-contained: no host, no network, no Python. 109 tests run, and CI runs
+Self-contained: no host, no network, no Python. 115 tests run, and CI runs
 nothing else. Verified by copying the tree somewhere isolated and running the
 suite there.
 
 | Suite | What it covers |
 |---|---|
-| unit (98) | every protocol layer in isolation: code pages, addressing, attributes, orders, inbound encoding, negotiation, framing |
+| unit (103) | every protocol layer in isolation: code pages, addressing, attributes, orders, inbound encoding, negotiation, framing, TLS configuration |
 | `tests/replay.rs` (10) | recorded wire transcripts replayed through the sans-IO core |
-| doc test (1) | the example in the crate docs compiles |
-| `tests/live_host.rs` (10) | optional, against a real host — `#[ignore]`d by default |
+| doc tests (2) | the examples in the crate docs compile |
+| `tests/live_host.rs` (14) | optional, against a real host including TLS — `#[ignore]`d by default |
 
 ### Recorded transcripts
 

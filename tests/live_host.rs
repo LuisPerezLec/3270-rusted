@@ -63,19 +63,30 @@ struct TestHost {
 impl TestHost {
     /// Start the host, or return `None` if it is not available here.
     fn start(extra: &[&str]) -> Option<TestHost> {
+        TestHost::start_inner(extra, None)
+    }
+
+    /// `await_port` is the listener to wait for. The host prints one
+    /// "listening on" line per listener, so waiting for the first would race a
+    /// TLS port that is bound second.
+    fn start_inner(extra: &[&str], await_port: Option<u16>) -> Option<TestHost> {
         let dir = host_dir()?;
         let port = free_port();
         let mut cmd = OsCommand::new("python3");
         cmd.current_dir(&dir)
-            .args(["-m", "mainframe", "--no-color", "--tls-port", "0"])
-            .args(["--port", &port.to_string()])
-            .args(extra)
+            .args(["-m", "mainframe", "--no-color"])
+            .args(["--port", &port.to_string()]);
+        if await_port.is_none() {
+            cmd.args(["--tls-port", "0"]);
+        }
+        cmd.args(extra)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = cmd.spawn().ok()?;
 
         // The host prints a "listening on" line once the socket is bound;
         // waiting for it beats sleeping and guessing.
+        let wanted = await_port.unwrap_or(port).to_string();
         let stdout = child.stdout.take().expect("piped stdout");
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
@@ -84,7 +95,7 @@ impl TestHost {
             if reader.read_line(&mut line).ok()? == 0 {
                 break;
             }
-            if line.contains("listening on") {
+            if line.contains("listening on") && line.contains(&wanted) {
                 // Keep draining in the background so the pipe never fills.
                 std::thread::spawn(move || {
                     let mut sink = String::new();
@@ -101,6 +112,12 @@ impl TestHost {
 
     fn addr(&self) -> String {
         format!("127.0.0.1:{}", self.port)
+    }
+
+    /// Start the host with a TLS listener on `tls_port` as well.
+    #[cfg(feature = "tls")]
+    fn start_with_tls(tls_port: u16) -> Option<TestHost> {
+        TestHost::start_inner(&["--tls-port", &tls_port.to_string()], Some(tls_port))
     }
 }
 
@@ -397,4 +414,120 @@ fn field_attributes_survive_the_round_trip() {
             "and protected labels"
         );
     });
+}
+
+// ---------------------------------------------------------------- TLS ------
+
+/// TLS tests need the Python host's generated certificates, so they use
+/// `TN3270_TEST_HOST_DIR` to find them and a host started with a TLS port.
+#[cfg(feature = "tls")]
+mod tls {
+    use super::*;
+    use tn3270::TlsConfig;
+
+    fn ca_path() -> PathBuf {
+        host_dir()
+            .expect("TLS tests need TN3270_TEST_HOST_DIR")
+            .join("certs/ca.crt")
+    }
+
+    /// Start the host with a TLS listener and return its TLS port.
+    fn tls_host() -> (TestHost, u16) {
+        let port = free_port();
+        let host = TestHost::start_with_tls(port).expect("host with TLS starts");
+        (host, port)
+    }
+
+    #[test]
+    #[ignore = "needs a live host; see the module docs"]
+    fn tls12_with_the_hosts_ca_completes_a_session() {
+        if std::env::var_os("TN3270_TEST_HOST_DIR").is_none() {
+            panic!("set TN3270_TEST_HOST_DIR so the generated CA can be found");
+        }
+        let (_host, port) = tls_host();
+        let tls = TlsConfig::with_ca_file(ca_path())
+            .expect("the CA file should parse")
+            .tls12_only();
+        let mut conn = Connection::connect_tls(
+            format!("127.0.0.1:{port}"),
+            "localhost",
+            SessionConfig::model(Model::Model3),
+            &tls,
+            TIMEOUT,
+        )
+        .expect("TLS connects");
+        conn.wait_until_unlocked(TIMEOUT).expect("host paints");
+
+        let (version, _suite) = conn.tls_info().expect("an encrypted connection");
+        assert_eq!(
+            version,
+            rustls::ProtocolVersion::TLSv1_2,
+            "the host is pinned to 1.2 and so are we"
+        );
+        assert!(conn.screen().find("TN3270 TEST HOST").is_some());
+        assert!(conn.screen().find("TLS1.2").is_some(), "host reports TLS");
+    }
+
+    #[test]
+    #[ignore = "needs a live host; see the module docs"]
+    fn an_untrusted_certificate_is_refused() {
+        if std::env::var_os("TN3270_TEST_HOST_DIR").is_none() {
+            panic!("set TN3270_TEST_HOST_DIR so the generated CA can be found");
+        }
+        let (_host, port) = tls_host();
+        // Public roots did not sign this certificate.
+        let tls = TlsConfig::with_webpki_roots();
+        let err = Connection::connect_tls(
+            format!("127.0.0.1:{port}"),
+            "localhost",
+            SessionConfig::model(Model::Model2),
+            &tls,
+            TIMEOUT,
+        )
+        .expect_err("an unknown issuer must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("UnknownIssuer") || msg.contains("certificate"),
+            "unhelpful error: {msg}"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a live host; see the module docs"]
+    fn a_certificate_name_mismatch_is_refused() {
+        if std::env::var_os("TN3270_TEST_HOST_DIR").is_none() {
+            panic!("set TN3270_TEST_HOST_DIR so the generated CA can be found");
+        }
+        let (_host, port) = tls_host();
+        let tls = TlsConfig::with_ca_file(ca_path()).expect("CA parses");
+        let err = Connection::connect_tls(
+            format!("127.0.0.1:{port}"),
+            "wrong.example.com",
+            SessionConfig::model(Model::Model2),
+            &tls,
+            TIMEOUT,
+        )
+        .expect_err("a name mismatch must be refused");
+        assert!(
+            err.to_string().contains("not valid for name"),
+            "the error should name the problem: {err}"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a live host; see the module docs"]
+    fn insecure_mode_connects_without_any_trust_anchor() {
+        let (_host, port) = tls_host();
+        let tls = TlsConfig::insecure();
+        let mut conn = Connection::connect_tls(
+            format!("127.0.0.1:{port}"),
+            "127.0.0.1",
+            SessionConfig::model(Model::Model2),
+            &tls,
+            TIMEOUT,
+        )
+        .expect("insecure mode ignores the trust chain");
+        conn.wait_until_unlocked(TIMEOUT).expect("host paints");
+        assert!(conn.screen().find("TN3270 TEST HOST").is_some());
+    }
 }

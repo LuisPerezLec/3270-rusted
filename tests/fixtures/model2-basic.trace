@@ -13,12 +13,13 @@
 < fffd18
 > fffb18
 < fffa1801fff0
-> fffa180049424d2d333237392d322d45fff0fffd19fffd00
+> fffa180049424d2d333237392d322d45fff0
 < fffd19
-> fffb19
-< fffb19fffd00fffb00
+> fffb19fffd19
+< fffb19fffd00
+> fffb00fffd00
+< fffb00
 # event Connected { mode: Tn3270, device_type: DeviceType { model: Model2, extended: true, color: true }, lu: None, functions: [] }
-> fffb00
 < f3000501ffff02ffef
 # event ScreenUpdated
 > 88000a81808081868788a60017818101000050001801000a02e50002006f090c078000168186000800f4f1f1f2f2f3f3f4f4f5f5f6f6f7f7000f81870500f0f1f1f2f2f4f4f8f800078188000102001181a600000b01000050001800500018ffef
