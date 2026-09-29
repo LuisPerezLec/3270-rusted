@@ -9,6 +9,59 @@ automation, ordered so the surprises arrive early and cheaply.
 
 ---
 
+## Step 0 — Using it without publishing
+
+Publishing to crates.io is optional and unrelated to using the crate. Pick
+whichever of these fits the network.
+
+**Nothing at all.** The examples run in place, straight from a clone:
+
+```bash
+git clone <repo> && cd 3270-rusted
+cargo run --example trace -- mvs.example.com:23
+```
+
+With default features this pulls **no dependencies whatsoever** — the protocol
+core has none — so a `cargo build` here downloads nothing.
+
+**A path dependency**, for an application beside the clone:
+
+```toml
+# myapp/Cargo.toml, with the clone as a sibling directory
+[dependencies]
+tn3270 = { path = "../3270-rusted" }
+# or, when TLS is needed:
+# tn3270 = { path = "../3270-rusted", features = ["tls"] }
+```
+
+**A git dependency**, when an internal git host is reachable:
+
+```toml
+[dependencies]
+tn3270 = { git = "https://git.internal.example/team/3270-rusted.git", tag = "v0.1.0" }
+```
+
+**Fully offline**, if the registry is not reachable at all. Vendor once on a
+machine that can download, then copy the tree across:
+
+```bash
+cargo vendor ../vendor > .cargo/config.toml
+cargo build --offline
+```
+
+Two things to know before enabling `tls`:
+
+* it pulls in rustls and its dependencies — 27 crates, against **zero** without
+  it — so prove plain-text connectivity first and add TLS after;
+* rustls's `ring` backend compiles C and assembly, so a C compiler must be
+  present. On Linux `cc` is needed to link any Rust binary anyway, so this is
+  rarely a new requirement, but it is worth checking before blaming the crate.
+
+A path dependency has to be replaced with a version or git reference if the
+application is ever published itself. Nothing else about this needs revisiting.
+
+---
+
 ## Step 1 — Probe before writing any code
 
 ```bash
