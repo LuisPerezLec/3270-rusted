@@ -57,7 +57,7 @@ independent host implementation.
 | Inbound | AID, cursor, modified fields, short reads, `SYSREQ`, Read Buffer |
 | Screen model | fields, basic and extended attributes, colour, highlighting, cursor, text search |
 | Code pages | cp037, cp273, cp500, cp1026, cp1140 |
-| TLS | 1.2 and 1.3 via `rustls`, with an internal-CA trust store, optional 1.2 pinning, and IP-SAN verification |
+| TLS | two backends: `rustls` for modern hosts, `native-tls` for legacy ones. Internal-CA trust, optional 1.2 pinning, chain-only verification |
 
 **Not yet**
 
@@ -92,6 +92,104 @@ conn.wait_for_quiet(Duration::from_millis(500), timeout)?;
 
 Use `wait_until_unlocked` for a request/response panel, and `wait_for_quiet`
 when the host volunteers screens. The probe below reports which case you are in.
+
+## TLS
+
+```rust
+use tn3270::{Connection, Model, SessionConfig, RustlsConfig};
+let tls = RustlsConfig::with_ca_file("corp-ca.pem")?.tls12_only();
+let mut conn = Connection::connect_tls(
+    "mvs.example.com:992",
+    "mvs.example.com",   // the name the certificate must match, not the dial address
+    SessionConfig::model(Model::Model2),
+    &tls,
+    timeout,
+)?;
+```
+
+### Which backend
+
+There are two, because they suit different hosts. This is a real decision, not a
+detail.
+
+| Backend | Feature | Supports | Needs |
+|---|---|---|---|
+| `RustlsConfig` | `tls-rustls` | ECDHE with AEAD, TLS 1.2 and 1.3 | nothing |
+| `NativeTlsConfig` | `tls-native` | whatever the OS does, including static RSA, DHE and CBC | OpenSSL headers on Linux |
+
+rustls deliberately implements **only six TLS 1.2 suites, all ECDHE with AEAD**,
+and only TLS 1.2 and 1.3. That is a sound security position and wrong for a lot
+of mainframes: z/OS System SSL and similar stacks commonly default to static-RSA
+or DHE suites with CBC, such as `TLS_RSA_WITH_AES_128_CBC_SHA`. Against such a
+host rustls has no suite in common and the handshake fails with
+`received fatal alert: HandshakeFailure` — which reads like a misconfiguration
+and is not. The error says as much, and names the other backend.
+
+For that host use `native-tls`, which defers to the operating system: OpenSSL on
+Linux, SChannel on Windows, Secure Transport on macOS.
+
+```rust
+use tn3270::NativeTlsConfig;
+let tls = NativeTlsConfig::with_ca_file("corp-ca.pem")?.tls12_only();
+```
+
+Where OpenSSL headers cannot be installed, `tls-native-vendored` compiles
+OpenSSL from source instead, needing only a C compiler and perl.
+
+Rather than reasoning about it, ask the host:
+
+```bash
+cargo run --all-features --example tls_probe -- mvs.example.com:992 --cafile corp-ca.pem
+```
+
+That tries every backend, protocol range and verification level, prints which
+handshakes succeed, and ends with a single recommendation. It performs only the
+handshake, so it is safe to point at a production host.
+
+### Verification
+
+`Verification::Full` checks the chain and the host name. `SkipHostname` still
+checks the chain, and is the right answer for a certificate whose name does not
+match the address it is reached at — both backends implement it properly, so it
+is not a euphemism for trusting anything. `None` checks nothing, and is for a
+first smoke test only.
+
+On "no C dependencies": rustls's default crypto backend, `ring`, contains some C
+and assembly that cargo builds for you, and `native-tls` links OpenSSL. What
+this removes is the x3270 C engine. The non-TLS core has no dependencies at all.
+
+## Pointing it at a real host
+
+**[docs/CONNECTING-TO-A-REAL-HOST.md](docs/CONNECTING-TO-A-REAL-HOST.md)** is the
+short path from "no idea what that host does" to working automation: how to use
+the crate without publishing it, probe first, read the verdict, then the traps in
+the order they bite.
+
+Verified against MVS 3.8j under Hercules. Its `TERMTEST` utility — an IBM-era
+program written to verify 3270 terminal capabilities — reports this crate's Query
+Reply, geometry, addressing mode and inbound records back correctly, including
+the exact AID and cursor bytes.
+
+## Tools
+
+Four examples, all useful against a real host:
+
+```bash
+# What does this host actually do? Sends no AID, so it cannot disturb anything.
+cargo run --example trace -- mvs.example.com:23
+
+# Which TLS settings will it accept? Handshake only, no 3270.
+cargo run --all-features --example tls_probe -- mvs.example.com:992
+
+# Connect, print the screen, and optionally drive it.
+cargo run --example screenshot -- mvs.example.com:23 \
+    --do key:Enter --do "type:logon myuser" --do key:Enter --do show
+
+# Capture a wire transcript for the test suite to replay.
+cargo run --example record_fixture -- 127.0.0.1:3270 --out tests/fixtures/new.trace
+```
+
+`trace` ends with a verdict and a paste-ready `SessionConfig` for that host.
 
 ## Layers
 
@@ -155,16 +253,16 @@ has a test naming it:
 cargo test
 ```
 
-Self-contained: no host, no network, no Python. 115 tests run, and CI runs
+Self-contained: no host, no network, no Python. 123 tests run, and CI runs
 nothing else. Verified by copying the tree somewhere isolated and running the
 suite there.
 
 | Suite | What it covers |
 |---|---|
-| unit (103) | every protocol layer in isolation: code pages, addressing, attributes, orders, inbound encoding, negotiation, framing, TLS configuration |
+| unit (111) | every protocol layer in isolation: code pages, addressing, attributes, orders, inbound encoding, negotiation, framing, TLS configuration |
 | `tests/replay.rs` (10) | recorded wire transcripts replayed through the sans-IO core |
 | doc tests (2) | the examples in the crate docs compile |
-| `tests/live_host.rs` (14) | optional, against a real host including TLS — `#[ignore]`d by default |
+| `tests/live_host.rs` (17) | optional, against a real host, including both TLS backends — `#[ignore]`d by default |
 
 ### Recorded transcripts
 

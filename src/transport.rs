@@ -57,16 +57,16 @@ impl From<ActionError> for WaitError {
 #[derive(Debug)]
 enum Stream {
     Plain(TcpStream),
-    #[cfg(feature = "tls")]
-    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+    #[cfg(feature = "tls-any")]
+    Tls(Box<dyn crate::tls::TlsStream>),
 }
 
 impl Stream {
     fn socket(&self) -> &TcpStream {
         match self {
             Stream::Plain(s) => s,
-            #[cfg(feature = "tls")]
-            Stream::Tls(s) => &s.sock,
+            #[cfg(feature = "tls-any")]
+            Stream::Tls(s) => s.socket(),
         }
     }
 
@@ -83,7 +83,7 @@ impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Stream::Plain(s) => s.read(buf),
-            #[cfg(feature = "tls")]
+            #[cfg(feature = "tls-any")]
             Stream::Tls(s) => s.read(buf),
         }
     }
@@ -93,7 +93,7 @@ impl Write for Stream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
             Stream::Plain(s) => s.write(buf),
-            #[cfg(feature = "tls")]
+            #[cfg(feature = "tls-any")]
             Stream::Tls(s) => s.write(buf),
         }
     }
@@ -101,7 +101,7 @@ impl Write for Stream {
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Stream::Plain(s) => s.flush(),
-            #[cfg(feature = "tls")]
+            #[cfg(feature = "tls-any")]
             Stream::Tls(s) => s.flush(),
         }
     }
@@ -154,50 +154,32 @@ impl Connection {
     /// SNI. It is separate from the dial address so a host reached by IP can
     /// still be verified against the name on its certificate.
     ///
-    /// The handshake is completed here rather than lazily, so a certificate
-    /// problem surfaces as an error from this call instead of from the first
+    /// `tls` is any [`TlsConnector`](crate::tls::TlsConnector): pass a
+    /// `RustlsConfig` for a modern host or a `NativeTlsConfig` for one whose
+    /// suites rustls declines to implement.
+    ///
+    /// The handshake is completed by the connector, so a certificate or cipher
+    /// problem surfaces as an error from this call rather than from the first
     /// read.
-    #[cfg(feature = "tls")]
+    #[cfg(feature = "tls-any")]
     pub fn connect_tls(
         addr: impl ToSocketAddrs,
         server_name: &str,
         config: SessionConfig,
-        tls: &crate::tls::TlsConfig,
+        tls: &dyn crate::tls::TlsConnector,
         timeout: Duration,
     ) -> Result<Connection, WaitError> {
-        use rustls_pki_types::ServerName;
-
         let addr = addr
             .to_socket_addrs()?
             .next()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no such address"))?;
-        let client_config = tls.build().map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("TLS setup failed: {e}"),
-            )
-        })?;
-        let name = ServerName::try_from(server_name.to_string()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{server_name:?} is not a valid DNS name or IP address"),
-            )
-        })?;
-
-        let mut socket = TcpStream::connect_timeout(&addr, timeout)?;
+        let socket = TcpStream::connect_timeout(&addr, timeout)?;
         socket.set_nodelay(true)?;
         socket.set_read_timeout(Some(timeout))?;
-        let mut tls_conn = rustls::ClientConnection::new(client_config, name)
-            .map_err(|e| io::Error::other(format!("TLS setup failed: {e}")))?;
-        // Drive the handshake now so errors are attributable.
-        while tls_conn.is_handshaking() {
-            tls_conn
-                .complete_io(&mut socket)
-                .map_err(|e| io::Error::new(e.kind(), format!("TLS handshake failed: {e}")))?;
-        }
+        let stream = tls.connect(socket, server_name)?;
 
         let mut conn = Connection {
-            stream: Stream::Tls(Box::new(rustls::StreamOwned::new(tls_conn, socket))),
+            stream: Stream::Tls(stream),
             session: Session::new(config),
             seen: Vec::new(),
         };
@@ -206,25 +188,38 @@ impl Connection {
         Ok(conn)
     }
 
-    /// The negotiated TLS protocol version and cipher suite, if this connection
-    /// is encrypted.
-    #[cfg(feature = "tls")]
-    pub fn tls_info(&self) -> Option<(rustls::ProtocolVersion, rustls::SupportedCipherSuite)> {
-        match &self.stream {
-            Stream::Tls(s) => Some((
-                s.conn.protocol_version()?,
-                s.conn.negotiated_cipher_suite()?,
-            )),
-            _ => None,
-        }
-    }
-
     pub fn session(&self) -> &Session {
         &self.session
     }
 
     pub fn screen(&self) -> &Screen {
         self.session.screen()
+    }
+
+    /// The negotiated TLS protocol version and cipher suite, when the
+    /// connection is encrypted and the backend reports them.
+    ///
+    /// rustls reports both. native-tls exposes neither, so it returns `None`
+    /// even on a working connection; use `openssl s_client` when the exact
+    /// suite matters.
+    #[cfg(feature = "tls-any")]
+    pub fn tls_info(&self) -> Option<(Option<String>, Option<String>)> {
+        match &self.stream {
+            Stream::Tls(s) => Some((s.protocol(), s.cipher())),
+            _ => None,
+        }
+    }
+
+    /// True when this connection is encrypted.
+    pub fn is_encrypted(&self) -> bool {
+        #[cfg(feature = "tls-any")]
+        {
+            matches!(self.stream, Stream::Tls(_))
+        }
+        #[cfg(not(feature = "tls-any"))]
+        {
+            false
+        }
     }
 
     /// Events observed so far, cleared by this call.

@@ -36,7 +36,7 @@ pub mod screen;
 pub mod session;
 pub mod telnet;
 
-#[cfg(feature = "tls")]
+#[cfg(feature = "tls-any")]
 pub mod tls;
 #[cfg(feature = "tcp")]
 pub mod transport;
@@ -48,7 +48,11 @@ pub use negotiate::{DeviceType, Function, Mode};
 pub use screen::{Cell, Field, Model, Screen};
 pub use session::{ActionError, Event, Session, SessionConfig};
 
-#[cfg(feature = "tls")]
-pub use tls::TlsConfig;
+#[cfg(feature = "tls-native")]
+pub use tls::NativeTlsConfig;
+#[cfg(feature = "tls-rustls")]
+pub use tls::RustlsConfig;
+#[cfg(feature = "tls-any")]
+pub use tls::{TlsConnector, TlsStream, Verification};
 #[cfg(feature = "tcp")]
 pub use transport::{Connection, WaitError};

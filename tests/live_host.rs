@@ -114,10 +114,17 @@ impl TestHost {
         format!("127.0.0.1:{}", self.port)
     }
 
-    /// Start the host with a TLS listener on `tls_port` as well.
-    #[cfg(feature = "tls")]
-    fn start_with_tls(tls_port: u16) -> Option<TestHost> {
-        TestHost::start_inner(&["--tls-port", &tls_port.to_string()], Some(tls_port))
+    /// Start the host with a TLS listener on `tls_port` as well, optionally
+    /// restricted to one OpenSSL cipher string.
+    #[cfg(feature = "tls-any")]
+    fn start_with_tls(tls_port: u16, ciphers: Option<&str>) -> Option<TestHost> {
+        let port = tls_port.to_string();
+        let mut extra = vec!["--tls-port", &port];
+        if let Some(c) = ciphers {
+            extra.push("--ciphers");
+            extra.push(c);
+        }
+        TestHost::start_inner(&extra, Some(tls_port))
     }
 }
 
@@ -420,10 +427,11 @@ fn field_attributes_survive_the_round_trip() {
 
 /// TLS tests need the Python host's generated certificates, so they use
 /// `TN3270_TEST_HOST_DIR` to find them and a host started with a TLS port.
-#[cfg(feature = "tls")]
+#[cfg(any(feature = "tls-rustls", feature = "tls-native"))]
 mod tls {
     use super::*;
-    use tn3270::TlsConfig;
+    use tn3270::tls::{TlsConnector, Verification};
+    use tn3270::WaitError;
 
     fn ca_path() -> PathBuf {
         host_dir()
@@ -431,102 +439,219 @@ mod tls {
             .join("certs/ca.crt")
     }
 
-    /// Start the host with a TLS listener and return its TLS port.
-    fn tls_host() -> (TestHost, u16) {
+    fn require_host_dir() {
+        assert!(
+            std::env::var_os("TN3270_TEST_HOST_DIR").is_some(),
+            "set TN3270_TEST_HOST_DIR so the generated CA can be found"
+        );
+    }
+
+    /// Start the host with a TLS listener, optionally restricted to one cipher.
+    fn tls_host(ciphers: Option<&str>) -> (TestHost, u16) {
         let port = free_port();
-        let host = TestHost::start_with_tls(port).expect("host with TLS starts");
+        let host = TestHost::start_with_tls(port, ciphers).expect("host with TLS starts");
         (host, port)
     }
 
+    fn session(port: u16, name: &str, tls: &dyn TlsConnector) -> Result<Connection, WaitError> {
+        Connection::connect_tls(
+            format!("127.0.0.1:{port}"),
+            name,
+            SessionConfig::model(Model::Model2),
+            tls,
+            TIMEOUT,
+        )
+    }
+
+    // ------------------------------------------------------------- rustls --
+
     #[test]
     #[ignore = "needs a live host; see the module docs"]
-    fn tls12_with_the_hosts_ca_completes_a_session() {
-        if std::env::var_os("TN3270_TEST_HOST_DIR").is_none() {
-            panic!("set TN3270_TEST_HOST_DIR so the generated CA can be found");
-        }
-        let (_host, port) = tls_host();
-        let tls = TlsConfig::with_ca_file(ca_path())
+    #[cfg(feature = "tls-rustls")]
+    fn rustls_completes_a_session_against_a_modern_host() {
+        use tn3270::RustlsConfig;
+        require_host_dir();
+        let (_host, port) = tls_host(None);
+        let tls = RustlsConfig::with_ca_file(ca_path())
             .expect("the CA file should parse")
             .tls12_only();
-        let mut conn = Connection::connect_tls(
-            format!("127.0.0.1:{port}"),
-            "localhost",
-            SessionConfig::model(Model::Model3),
-            &tls,
-            TIMEOUT,
-        )
-        .expect("TLS connects");
+        let mut conn = session(port, "localhost", &tls).expect("TLS connects");
         conn.wait_until_unlocked(TIMEOUT).expect("host paints");
 
-        let (version, _suite) = conn.tls_info().expect("an encrypted connection");
+        let (proto, cipher) = conn.tls_info().expect("an encrypted connection");
         assert_eq!(
-            version,
-            rustls::ProtocolVersion::TLSv1_2,
-            "the host is pinned to 1.2 and so are we"
+            proto.as_deref(),
+            Some("TLSv1_2"),
+            "the host is pinned to 1.2"
+        );
+        assert!(
+            cipher.as_deref().unwrap_or("").contains("ECDHE"),
+            "rustls only offers ECDHE: {cipher:?}"
         );
         assert!(conn.screen().find("TN3270 TEST HOST").is_some());
-        assert!(conn.screen().find("TLS1.2").is_some(), "host reports TLS");
     }
 
     #[test]
     #[ignore = "needs a live host; see the module docs"]
-    fn an_untrusted_certificate_is_refused() {
-        if std::env::var_os("TN3270_TEST_HOST_DIR").is_none() {
-            panic!("set TN3270_TEST_HOST_DIR so the generated CA can be found");
-        }
-        let (_host, port) = tls_host();
+    #[cfg(feature = "tls-rustls")]
+    fn rustls_refuses_an_untrusted_certificate() {
+        use tn3270::RustlsConfig;
+        require_host_dir();
+        let (_host, port) = tls_host(None);
         // Public roots did not sign this certificate.
-        let tls = TlsConfig::with_webpki_roots();
-        let err = Connection::connect_tls(
-            format!("127.0.0.1:{port}"),
-            "localhost",
-            SessionConfig::model(Model::Model2),
-            &tls,
-            TIMEOUT,
-        )
-        .expect_err("an unknown issuer must be refused");
-        let msg = err.to_string();
+        let err = session(port, "localhost", &RustlsConfig::with_webpki_roots())
+            .expect_err("an unknown issuer must be refused");
         assert!(
-            msg.contains("UnknownIssuer") || msg.contains("certificate"),
-            "unhelpful error: {msg}"
+            err.to_string().contains("UnknownIssuer"),
+            "unhelpful error: {err}"
         );
     }
 
     #[test]
     #[ignore = "needs a live host; see the module docs"]
-    fn a_certificate_name_mismatch_is_refused() {
-        if std::env::var_os("TN3270_TEST_HOST_DIR").is_none() {
-            panic!("set TN3270_TEST_HOST_DIR so the generated CA can be found");
-        }
-        let (_host, port) = tls_host();
-        let tls = TlsConfig::with_ca_file(ca_path()).expect("CA parses");
-        let err = Connection::connect_tls(
-            format!("127.0.0.1:{port}"),
-            "wrong.example.com",
-            SessionConfig::model(Model::Model2),
-            &tls,
-            TIMEOUT,
-        )
-        .expect_err("a name mismatch must be refused");
+    #[cfg(feature = "tls-rustls")]
+    fn rustls_refuses_a_name_mismatch_but_chain_only_accepts_it() {
+        use tn3270::RustlsConfig;
+        require_host_dir();
+        let (_host, port) = tls_host(None);
+
+        let full = RustlsConfig::with_ca_file(ca_path()).expect("CA parses");
+        let err =
+            session(port, "wrong.example.com", &full).expect_err("a name mismatch must be refused");
         assert!(
             err.to_string().contains("not valid for name"),
             "the error should name the problem: {err}"
         );
+
+        // Verification::SkipHostname still checks the chain, so the same
+        // mismatched name now connects while an untrusted CA would not.
+        let chain_only = RustlsConfig::with_ca_file(ca_path())
+            .expect("CA parses")
+            .verification(Verification::SkipHostname);
+        let mut conn = session(port, "wrong.example.com", &chain_only)
+            .expect("chain-only verification ignores the name");
+        conn.wait_until_unlocked(TIMEOUT).expect("host paints");
+        assert!(conn.screen().find("TN3270 TEST HOST").is_some());
+
+        // ...and chain-only must still reject an untrusted issuer.
+        let bad_chain = RustlsConfig::with_webpki_roots().verification(Verification::SkipHostname);
+        assert!(
+            session(port, "wrong.example.com", &bad_chain).is_err(),
+            "skipping the hostname must not skip the chain"
+        );
+    }
+
+    // --------------------------------------------------------- native-tls --
+
+    #[test]
+    #[ignore = "needs a live host; see the module docs"]
+    #[cfg(feature = "tls-native")]
+    fn native_tls_completes_a_session() {
+        use tn3270::NativeTlsConfig;
+        require_host_dir();
+        let (_host, port) = tls_host(None);
+        let tls = NativeTlsConfig::with_ca_file(ca_path())
+            .expect("CA parses")
+            .tls12_only();
+        let mut conn = session(port, "localhost", &tls).expect("TLS connects");
+        conn.wait_until_unlocked(TIMEOUT).expect("host paints");
+        assert!(conn.is_encrypted());
+        assert!(conn.screen().find("TN3270 TEST HOST").is_some());
     }
 
     #[test]
     #[ignore = "needs a live host; see the module docs"]
+    #[cfg(feature = "tls-native")]
+    fn native_tls_refuses_an_untrusted_certificate() {
+        use tn3270::NativeTlsConfig;
+        require_host_dir();
+        let (_host, port) = tls_host(None);
+        let err = session(port, "localhost", &NativeTlsConfig::with_system_roots())
+            .expect_err("an unknown issuer must be refused");
+        assert!(
+            err.to_string().to_lowercase().contains("certificate"),
+            "unhelpful error: {err}"
+        );
+    }
+
+    /// The finding that motivated a second backend.
+    ///
+    /// A host offering only `TLS_RSA_WITH_AES_128_CBC_SHA` -- static RSA key
+    /// exchange with CBC, which plenty of mainframe TLS stacks still default to
+    /// -- has no cipher suite in common with rustls. rustls must fail and
+    /// native-tls must succeed.
+    #[test]
+    #[ignore = "needs a live host; see the module docs"]
+    #[cfg(all(feature = "tls-rustls", feature = "tls-native"))]
+    fn a_static_rsa_only_host_needs_the_native_backend() {
+        use tn3270::{NativeTlsConfig, RustlsConfig};
+        require_host_dir();
+        let (_host, port) = tls_host(Some("AES128-SHA"));
+
+        let rustls = RustlsConfig::with_ca_file(ca_path())
+            .expect("CA parses")
+            .tls12_only();
+        let err = session(port, "localhost", &rustls)
+            .expect_err("rustls offers no static-RSA suite, so this must fail");
+        assert!(
+            err.to_string().contains("HandshakeFailure"),
+            "expected a handshake alert, got: {err}"
+        );
+        // The error must point at the cause rather than leaving it a mystery.
+        assert!(
+            err.to_string().contains("native-tls"),
+            "the error should suggest the other backend: {err}"
+        );
+
+        let native = NativeTlsConfig::with_ca_file(ca_path())
+            .expect("CA parses")
+            .tls12_only();
+        let mut conn = session(port, "localhost", &native)
+            .expect("the operating system's stack supports static RSA");
+        conn.wait_until_unlocked(TIMEOUT).expect("host paints");
+        assert!(conn.screen().find("TN3270 TEST HOST").is_some());
+    }
+
+    #[test]
+    #[ignore = "needs a live host; see the module docs"]
+    #[cfg(feature = "tls-native")]
+    fn native_tls_refuses_a_name_mismatch_but_chain_only_accepts_it() {
+        use tn3270::NativeTlsConfig;
+        require_host_dir();
+        let (_host, port) = tls_host(None);
+
+        let full = NativeTlsConfig::with_ca_file(ca_path()).expect("CA parses");
+        assert!(
+            session(port, "wrong.example.com", &full).is_err(),
+            "a name mismatch must be refused"
+        );
+
+        // SkipHostname still checks the chain.
+        let chain_only = NativeTlsConfig::with_ca_file(ca_path())
+            .expect("CA parses")
+            .verification(Verification::SkipHostname);
+        let mut conn = session(port, "wrong.example.com", &chain_only)
+            .expect("chain-only verification ignores the name");
+        conn.wait_until_unlocked(TIMEOUT).expect("host paints");
+        assert!(conn.screen().find("TN3270 TEST HOST").is_some());
+
+        // ...and must still reject an untrusted issuer.
+        let bad_chain =
+            NativeTlsConfig::with_system_roots().verification(Verification::SkipHostname);
+        assert!(
+            session(port, "wrong.example.com", &bad_chain).is_err(),
+            "skipping the hostname must not skip the chain"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a live host; see the module docs"]
+    #[cfg(feature = "tls-native")]
     fn insecure_mode_connects_without_any_trust_anchor() {
-        let (_host, port) = tls_host();
-        let tls = TlsConfig::insecure();
-        let mut conn = Connection::connect_tls(
-            format!("127.0.0.1:{port}"),
-            "127.0.0.1",
-            SessionConfig::model(Model::Model2),
-            &tls,
-            TIMEOUT,
-        )
-        .expect("insecure mode ignores the trust chain");
+        use tn3270::NativeTlsConfig;
+        let (_host, port) = tls_host(None);
+        let mut conn = session(port, "127.0.0.1", &NativeTlsConfig::insecure())
+            .expect("insecure mode ignores the trust chain");
         conn.wait_until_unlocked(TIMEOUT).expect("host paints");
         assert!(conn.screen().find("TN3270 TEST HOST").is_some());
     }

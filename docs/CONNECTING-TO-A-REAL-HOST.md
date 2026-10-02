@@ -30,8 +30,9 @@ core has none — so a `cargo build` here downloads nothing.
 # myapp/Cargo.toml, with the clone as a sibling directory
 [dependencies]
 tn3270 = { path = "../3270-rusted" }
-# or, when TLS is needed:
-# tn3270 = { path = "../3270-rusted", features = ["tls"] }
+# or, when TLS is needed, naming a backend (see Step 1b):
+# tn3270 = { path = "../3270-rusted", features = ["tls-rustls"] }
+# tn3270 = { path = "../3270-rusted", features = ["tls-native"] }
 ```
 
 **A git dependency**, when an internal git host is reachable:
@@ -49,13 +50,15 @@ cargo vendor ../vendor > .cargo/config.toml
 cargo build --offline
 ```
 
-Two things to know before enabling `tls`:
+Two things to know before enabling TLS:
 
-* it pulls in rustls and its dependencies — 27 crates, against **zero** without
-  it — so prove plain-text connectivity first and add TLS after;
-* rustls's `ring` backend compiles C and assembly, so a C compiler must be
-  present. On Linux `cc` is needed to link any Rust binary anyway, so this is
-  rarely a new requirement, but it is worth checking before blaming the crate.
+* it pulls in a dependency tree — around 27 crates, against **zero** without it —
+  so prove plain-text connectivity first and add TLS after;
+* both backends need a C compiler. `tls-rustls` compiles `ring`'s C and
+  assembly; `tls-native` links the system OpenSSL and needs its headers
+  (`libssl-dev`, `openssl-devel`), or `tls-native-vendored` to compile OpenSSL
+  from source. On Linux `cc` is needed to link any Rust binary anyway, so the
+  compiler itself is rarely a new requirement.
 
 A path dependency has to be replaced with a version or git reference if the
 application is ever published itself. Nothing else about this needs revisiting.
@@ -89,6 +92,40 @@ Read the verdict like this:
 | `Unsolicited  N screens arrived` | the host volunteers screens | use `wait_for_quiet` |
 
 The verdict ends with a paste-ready `SessionConfig` for that host.
+
+---
+
+## Step 1b — If the port is TLS, find out what it accepts
+
+A TLS handshake failure is the most likely first obstacle, and the cause is
+usually not a setting but the **backend**.
+
+```bash
+cargo run --all-features --example tls_probe -- mvs.example.com:992 \
+    --cafile corp-ca.pem --servername mvs.example.com
+```
+
+This tries every backend, protocol range and verification level, prints which
+handshakes succeed, and ends with one recommendation. It performs only the
+handshake, so it is safe against a production host.
+
+Why a backend matters: **rustls implements only six TLS 1.2 cipher suites, all
+ECDHE with AEAD**, and only TLS 1.2 and 1.3. Many mainframe TLS stacks default
+to static-RSA or DHE suites with CBC — `TLS_RSA_WITH_AES_128_CBC_SHA` and
+friends. Against such a host rustls has nothing in common and fails with
+`received fatal alert: HandshakeFailure`. No amount of configuration fixes that;
+the suites are not implemented.
+
+| Probe result | Meaning | Action |
+|---|---|---|
+| rustls rows OK | modern host | use `tls-rustls`: no system dependency |
+| only native-tls rows OK | legacy suites or version | use `tls-native` |
+| nothing OK | no suite in common with either | check `openssl s_client -connect host:port -tls1_2` |
+| `full` fails, `chain only` works | certificate name mismatch | pass the right `--servername`, or `Verification::SkipHostname` |
+| only `none` works | the issuing CA is not trusted | export it and pass `--cafile` |
+
+`SkipHostname` still verifies the chain in both backends, so it is a reasonable
+permanent setting for a certificate whose name cannot be matched. `None` is not.
 
 ---
 
@@ -148,11 +185,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Over TLS, replace the connect call:
+Over TLS, replace the connect call with whichever backend the probe chose:
 
 ```rust
-use tn3270::TlsConfig;
-let tls = TlsConfig::with_ca_file("corp-ca.pem")?.tls12_only();
+// Modern host: --features tls-rustls
+use tn3270::RustlsConfig;
+let tls = RustlsConfig::with_ca_file("corp-ca.pem")?.tls12_only();
+
+// Legacy host: --features tls-native
+// use tn3270::NativeTlsConfig;
+// let tls = NativeTlsConfig::with_ca_file("corp-ca.pem")?.tls12_only();
+
 let mut conn = Connection::connect_tls(
     "mvs.example.com:992",
     "mvs.example.com",       // the name on the certificate, not the dial address
@@ -160,7 +203,7 @@ let mut conn = Connection::connect_tls(
 )?;
 ```
 
-Requires `--features tls`.
+Both implement `TlsConnector`, so only the two lines above change.
 
 ---
 
@@ -193,17 +236,23 @@ manager or a `USSMSG` in telnet line mode first. It arrives as
 reports such text but does not drive a line-mode dialogue, so a host that
 requires one needs its front end handled another way.
 
-**6. The TLS name is not the dial address.** `connect_tls` takes the
+**6. A TLS handshake failure usually means the wrong backend, not a wrong
+setting.** `received fatal alert: HandshakeFailure` from rustls against a
+mainframe almost always means the host offers static-RSA or DHE suites that
+rustls does not implement. Run `tls_probe` and switch to `tls-native` rather
+than hunting for a configuration option. The error message says this too.
+
+**7. The TLS name is not the dial address.** `connect_tls` takes the
 certificate name separately, so a host reached by IP can still be verified
 against the name on its certificate. On a mismatch, rustls lists the
 certificate's valid names in the error — read it rather than reaching for
 `insecure()`.
 
-**7. `CLEAR` and `PA1`–`PA3` send the AID byte alone.** No cursor, no fields.
+**8. `CLEAR` and `PA1`–`PA3` send the AID byte alone.** No cursor, no fields.
 That is correct and handled; just do not expect field data to reach the host on
 those keys.
 
-**8. Sessions outlive the TCP connection.** Dropping a connection can leave the
+**9. Sessions outlive the TCP connection.** Dropping a connection can leave the
 session logged on, and the next logon is then refused (`userid in use`,
 `waiting for reconnect`). Log off properly at the end of a script.
 
@@ -236,8 +285,11 @@ unsolicited `DO`, that is the first thing to suspect.
 | `ActionError::ProtectedField` | cursor on an attribute byte or wrong screen | `cursorinfo`, then `set_cursor` explicitly |
 | `ActionError::KeyboardLocked` | the host has not finished | wait for `Event::KeyboardUnlocked` |
 | Layout right, accents wrong | wrong code page | set the code page |
-| `TLS handshake failed: UnknownIssuer` | the CA is not trusted | `TlsConfig::with_ca_file` with the internal CA |
-| `certificate not valid for name` | wrong certificate name | use the name the error lists |
+| `TLS handshake failed: ... HandshakeFailure` | no cipher suite in common; rustls offers ECDHE/AEAD only | run `tls_probe`; switch to `tls-native` |
+| `TLS handshake failed: UnknownIssuer` | the CA is not trusted | `with_ca_file` with the internal CA |
+| `certificate not valid for name` | wrong certificate name | use a name the error lists, or `Verification::SkipHostname` |
+| `unsupported protocol` from native-tls | the OS refuses that TLS version | lower `MinProtocol`/`SECLEVEL` in `openssl.cnf` |
+| TLS builds fail on `openssl-sys` | no OpenSSL headers | use `tls-native-vendored`, or install `libssl-dev` |
 | `Event::ProtocolError("host addressed cell N…")` | host wrote for the alternate screen while on the primary | the negotiated model is smaller than the host assumes; check the probe's model |
 | `userid in use` on logon | a previous session is still on | log off at the end of scripts |
 

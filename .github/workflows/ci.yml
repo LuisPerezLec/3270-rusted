@@ -26,5 +26,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # The native-only build has its own cfg paths, and a break there is
+      # invisible to --all-features. GitHub runners ship libssl-dev, so the
+      # system OpenSSL is used rather than the vendored one.
+      - name: Clippy with only the native TLS backend
+        run: cargo clippy --all-targets --features tls-native -- -D warnings
+
+      - name: Clippy with only the rustls backend
+        run: cargo clippy --all-targets --features tls-rustls -- -D warnings
+
       - name: Format
         run: cargo fmt --check

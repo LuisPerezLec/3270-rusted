@@ -2,7 +2,7 @@
 name = "tn3270"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.80"
 description = "IBM 3270 terminal emulator and automation library: TN3270/TN3270E protocol, screen model, and scripting primitives, with no C dependencies"
 keywords = ["3270", "tn3270", "mainframe", "terminal", "automation"]
 categories = ["network-programming", "emulators"]
@@ -15,16 +15,48 @@ default = ["tcp"]
 # A blocking TCP transport. The protocol core itself needs no features and has
 # no dependencies.
 tcp = []
-# TLS via rustls, so there is still no OpenSSL to link against.
-tls = ["tcp", "dep:rustls", "dep:rustls-pki-types", "dep:rustls-pemfile", "dep:webpki-roots"]
+# Internal marker, enabled automatically by either TLS backend. It exists so a
+# target can declare `required-features = ["tls-any"]`, which Cargo cannot
+# express as an OR of the two. Selecting it on its own enables no backend and
+# will not build; pick tls-rustls or tls-native instead.
+tls-any = []
+# TLS is pluggable, because the two backends suit different hosts.
+#
+# rustls: modern, no system dependency, but ECDHE with AEAD only. It cannot
+# talk to a host that offers static-RSA or DHE suites, which many mainframe
+# TLS stacks still default to.
+tls-rustls = ["tcp", "tls-any", "dep:rustls", "dep:rustls-pki-types", "dep:rustls-pemfile", "dep:webpki-roots"]
+# native-tls: whatever the operating system supports -- OpenSSL on Linux,
+# SChannel on Windows, Secure Transport on macOS. Use this for a legacy host.
+tls-native = ["tcp", "tls-any", "dep:native-tls"]
+# As above, but compiles OpenSSL from source instead of linking the system one.
+# Needs a C compiler and perl; use it when libssl-dev is not installable.
+tls-native-vendored = ["tls-native", "native-tls/vendored"]
+# Backwards-compatible alias for the rustls backend.
+tls = ["tls-rustls"]
 
 [dependencies]
 rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "tls12", "ring", "logging"] }
 rustls-pki-types = { version = "1", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 webpki-roots = { version = "1", optional = true }
+native-tls = { version = "0.2.14", optional = true }
 
 [dev-dependencies]
+
+# screenshot and the live-host tests drive a real connection, so they need the
+# blocking transport. Without this, `--no-default-features` tries to build them.
+[[example]]
+name = "screenshot"
+required-features = ["tcp"]
+
+[[example]]
+name = "tls_probe"
+required-features = ["tls-any"]
+
+[[test]]
+name = "live_host"
+required-features = ["tcp"]
 
 [profile.test]
 opt-level = 1

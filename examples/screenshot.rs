@@ -31,6 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut servername: Option<String> = None;
     let mut insecure = false;
     let mut tls12_only = false;
+    let mut tls_backend = String::from("rustls");
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -47,6 +48,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--servername" => servername = args.next(),
             "--insecure" => insecure = true,
             "--tls12-only" => tls12_only = true,
+            "--tls-backend" => {
+                tls_backend = args.next().ok_or("--tls-backend needs rustls or native")?
+            }
             "--device" => {
                 let name = args.next().ok_or("--device needs a name")?;
                 let dt = tn3270::DeviceType::parse(&name)
@@ -71,7 +75,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("connecting to {addr} as {}", config.negotiate.device_type);
     let mut conn = if tls {
-        connect_tls(&addr, config, cafile, servername, insecure, tls12_only)?
+        connect_tls(
+            &addr,
+            config,
+            cafile,
+            servername,
+            insecure,
+            tls12_only,
+            &tls_backend,
+        )?
     } else {
         Connection::connect(&addr, config, TIMEOUT)?
     };
@@ -206,7 +218,8 @@ fn parse_key(name: &str) -> Option<Aid> {
     }
 }
 
-#[cfg(feature = "tls")]
+/// Build a TLS connector for the chosen backend and connect.
+#[cfg(any(feature = "tls-rustls", feature = "tls-native"))]
 fn connect_tls(
     addr: &str,
     config: SessionConfig,
@@ -214,16 +227,10 @@ fn connect_tls(
     servername: Option<String>,
     insecure: bool,
     tls12_only: bool,
+    backend: &str,
 ) -> Result<Connection, Box<dyn std::error::Error>> {
-    use tn3270::TlsConfig;
-    let mut tls = match (&cafile, insecure) {
-        (Some(path), _) => TlsConfig::with_ca_file(path)?,
-        (None, true) => TlsConfig::insecure(),
-        (None, false) => TlsConfig::with_webpki_roots(),
-    };
-    if tls12_only {
-        tls = tls.tls12_only();
-    }
+    use tn3270::tls::{TlsConnector, Verification};
+
     // The name the certificate must match. Defaults to the dialled host, which
     // fails for an IP unless the certificate carries an IP SAN.
     let name = servername.unwrap_or_else(|| {
@@ -231,15 +238,62 @@ fn connect_tls(
             .map(|(h, _)| h.to_string())
             .unwrap_or_else(|| addr.to_string())
     });
-    println!("  TLS, verifying against {name:?}");
-    let conn = Connection::connect_tls(addr, &name, config, &tls, TIMEOUT)?;
-    if let Some((version, suite)) = conn.tls_info() {
-        println!("  negotiated {version:?} with {:?}", suite.suite());
+    let verification = if insecure {
+        Verification::None
+    } else {
+        Verification::Full
+    };
+
+    let connector: Box<dyn TlsConnector> = match backend {
+        #[cfg(feature = "tls-rustls")]
+        "rustls" => {
+            use tn3270::RustlsConfig;
+            let mut c = match &cafile {
+                Some(path) => RustlsConfig::with_ca_file(path)?,
+                None => RustlsConfig::with_webpki_roots(),
+            }
+            .verification(verification);
+            if tls12_only {
+                c = c.tls12_only();
+            }
+            Box::new(c)
+        }
+        #[cfg(feature = "tls-native")]
+        "native" => {
+            use tn3270::NativeTlsConfig;
+            let mut c = match &cafile {
+                Some(path) => NativeTlsConfig::with_ca_file(path)?,
+                None => NativeTlsConfig::with_system_roots(),
+            }
+            .verification(verification);
+            if tls12_only {
+                c = c.tls12_only();
+            }
+            Box::new(c)
+        }
+        other => {
+            return Err(format!(
+                "unknown or not-compiled-in TLS backend {other:?}; \
+                 build with --features tls-rustls,tls-native"
+            )
+            .into())
+        }
+    };
+
+    println!(
+        "  TLS via {}, verifying against {name:?}",
+        connector.backend()
+    );
+    let conn = Connection::connect_tls(addr, &name, config, connector.as_ref(), TIMEOUT)?;
+    match conn.tls_info() {
+        Some((Some(proto), Some(cipher))) => println!("  negotiated {proto} with {cipher}"),
+        Some(_) => println!("  handshake complete (this backend does not report the suite)"),
+        None => println!("  not encrypted"),
     }
     Ok(conn)
 }
 
-#[cfg(not(feature = "tls"))]
+#[cfg(not(any(feature = "tls-rustls", feature = "tls-native")))]
 fn connect_tls(
     _addr: &str,
     _config: SessionConfig,
@@ -247,8 +301,9 @@ fn connect_tls(
     _servername: Option<String>,
     _insecure: bool,
     _tls12_only: bool,
+    _backend: &str,
 ) -> Result<Connection, Box<dyn std::error::Error>> {
-    Err("this build has no TLS; rebuild with --features tls".into())
+    Err("this build has no TLS; rebuild with --features tls-rustls or tls-native".into())
 }
 
 fn show(conn: &Connection) {
